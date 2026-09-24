@@ -88,38 +88,35 @@ client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openai/v1",
 )
+def extract_string_frame_lines(tb: str) -> List[int]:
+    """
+    Extract line numbers specifically from '<string>' frames - these are
+    always the user's actual code (from exec()), regardless of any
+    wrapper frames (threading, executors) surrounding them.
+    """
+    return [int(m) for m in re.findall(r'File "<string>", line (\d+)', tb)]
 
-def extract_traceback_line_numbers(tb: str) -> List[int]:
-    """
-    Extract every line number Python's own traceback reports.
-    This is ground truth - Python computed these exactly, no guessing needed.
-    """
-    matches = re.findall(r'File "[^"]*", line (\d+)', tb)
-    return [int(m) for m in matches]
 
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
     """
-    Use LLM with structured output to identify the error line number(s),
-    grounded in line numbers actually extracted from the traceback.
+    Identify the error line number(s). Prefer deterministic extraction
+    from the traceback's own '<string>' frames (always correct, since
+    Python computed them). Only fall back to AI if no such frame exists
+    (e.g. unusual error types).
     """
-    candidate_lines = extract_traceback_line_numbers(tb)
+    string_frame_lines = extract_string_frame_lines(tb)
 
-    # If we found exactly one candidate, trust it directly - no need to
-    # risk the AI mis-copying a number that's already unambiguous.
-    if len(candidate_lines) == 1:
-        return candidate_lines
+    if string_frame_lines:
+        # The deepest (last) <string> frame is where the actual error occurred
+        return [string_frame_lines[-1]]
 
-    # If there are 0 or multiple candidates, ask the AI to pick the
-    # single most relevant line, but constrain it to ONLY choose from
-    # numbers we already extracted - it cannot invent a new one.
+    # Fallback: no <string> frame found at all - ask AI, but constrain it
+    # to numbers that actually appear anywhere in the traceback.
+    all_candidates = [int(m) for m in re.findall(r'line (\d+)', tb)]
+
     prompt = f"""Analyze this Python code and its error traceback.
-
-The traceback mentions these candidate line numbers (extracted directly
-from the traceback text): {candidate_lines}
-
-Identify which of these candidate line numbers best represents where the
-actual error occurred (usually the deepest/last frame in the traceback).
-Only return number(s) from this candidate list - do not invent new ones.
+Identify the single most likely line number in the CODE where the error
+originated. Only choose from numbers that appear in the traceback.
 
 CODE:
 {code}
@@ -152,13 +149,12 @@ TRACEBACK:
 
     result = ErrorAnalysis.model_validate_json(response.choices[0].message.content)
 
-    # Safety net: if the AI still returns something outside our known
-    # candidates, fall back to the last (deepest) candidate line instead
-    # of trusting a hallucinated number.
-    if candidate_lines and not all(l in candidate_lines for l in result.error_lines):
-        return [candidate_lines[-1]]
+    if result.error_lines and all(l in all_candidates for l in result.error_lines):
+        return result.error_lines
 
-    return result.error_lines if result.error_lines else candidate_lines
+    # Last-resort fallback: just the first candidate, never dump everything
+    return [all_candidates[0]] if all_candidates else [] 
+
 # ---------- Endpoint ----------
 
 @app.post("/code-interpreter")
