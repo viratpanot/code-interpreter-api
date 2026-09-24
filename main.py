@@ -1,8 +1,8 @@
 import os
 import sys
-import json
 import re
 import traceback
+import concurrent.futures
 from io import StringIO
 from typing import List
 
@@ -13,7 +13,6 @@ from openai import OpenAI
 
 app = FastAPI()
 
-# CORS Enabled: Required for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,42 +21,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Request/Response models ----------
-
 class CodeRequest(BaseModel):
     code: str
 
 class ErrorAnalysis(BaseModel):
     error_lines: List[int]
-
-# ---------- Part 1: Tool Function ----------
-
-
-import concurrent.futures
-
-def clean_traceback(tb: str) -> str:
-    """
-    Remove internal ThreadPoolExecutor/threading frames from the traceback,
-    keeping only what a plain exec() call would have produced.
-    """
-    lines = tb.splitlines(keepends=True)
-    cleaned = []
-    skip_block = False
-
-    for line in lines:
-        # Start of an internal frame block we want to hide
-        if 'File "' in line and ('concurrent/futures' in line or 'threading.py' in line):
-            skip_block = True
-            continue
-        # Once we hit the user's own <string> frame, stop skipping
-        if 'File "<string>"' in line:
-            skip_block = False
-        if skip_block:
-            continue
-        cleaned.append(line)
-
-    return "".join(cleaned)
-
 
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
@@ -76,42 +44,33 @@ def execute_python_code(code: str) -> dict:
         return {"success": False, "output": "Error: code execution timed out"}
     except Exception:
         output = traceback.format_exc()
-        output = clean_traceback(output)
         return {"success": False, "output": output}
     finally:
         sys.stdout = old_stdout
-
-
-# ---------- Part 2: AI Error Analysis ----------
 
 client = OpenAI(
     api_key=os.environ.get("AIPIPE_TOKEN"),
     base_url="https://aipipe.org/openai/v1",
 )
+
 def extract_string_frame_lines(tb: str) -> List[int]:
     """
-    Extract line numbers specifically from '<string>' frames - these are
-    always the user's actual code (from exec()), regardless of any
-    wrapper frames (threading, executors) surrounding them.
+    Line numbers from '<string>' frames only - always present and always
+    correct for anything raised inside exec(), regardless of any wrapper
+    frames (threading, executors) surrounding it.
     """
     return [int(m) for m in re.findall(r'File "<string>", line (\d+)', tb)]
 
-
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
     """
-    Identify the error line number(s). Prefer deterministic extraction
-    from the traceback's own '<string>' frames (always correct, since
-    Python computed them). Only fall back to AI if no such frame exists
-    (e.g. unusual error types).
+    Deterministically pick the deepest '<string>' frame - that's always
+    where the real error occurred. AI is only a last-resort fallback.
     """
     string_frame_lines = extract_string_frame_lines(tb)
 
     if string_frame_lines:
-        # The deepest (last) <string> frame is where the actual error occurred
         return [string_frame_lines[-1]]
 
-    # Fallback: no <string> frame found at all - ask AI, but constrain it
-    # to numbers that actually appear anywhere in the traceback.
     all_candidates = [int(m) for m in re.findall(r'line (\d+)', tb)]
 
     prompt = f"""Analyze this Python code and its error traceback.
@@ -152,10 +111,7 @@ TRACEBACK:
     if result.error_lines and all(l in all_candidates for l in result.error_lines):
         return result.error_lines
 
-    # Last-resort fallback: just the first candidate, never dump everything
-    return [all_candidates[0]] if all_candidates else [] 
-
-# ---------- Endpoint ----------
+    return [all_candidates[0]] if all_candidates else []
 
 @app.post("/code-interpreter")
 def code_interpreter(request: CodeRequest):
@@ -166,5 +122,3 @@ def code_interpreter(request: CodeRequest):
 
     error_lines = analyze_error_with_ai(request.code, exec_result["output"])
     return {"error": error_lines, "result": exec_result["output"]}
-
-
