@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import traceback
 from io import StringIO
 from typing import List
@@ -63,14 +64,37 @@ client = OpenAI(
     base_url="https://aipipe.org/openai/v1",
 )
 
+def extract_traceback_line_numbers(tb: str) -> List[int]:
+    """
+    Extract every line number Python's own traceback reports.
+    This is ground truth - Python computed these exactly, no guessing needed.
+    """
+    matches = re.findall(r'File "[^"]*", line (\d+)', tb)
+    return [int(m) for m in matches]
+
 def analyze_error_with_ai(code: str, tb: str) -> List[int]:
     """
-    Use LLM with structured output to identify error line numbers.
+    Use LLM with structured output to identify the error line number(s),
+    grounded in line numbers actually extracted from the traceback.
     """
+    candidate_lines = extract_traceback_line_numbers(tb)
+
+    # If we found exactly one candidate, trust it directly - no need to
+    # risk the AI mis-copying a number that's already unambiguous.
+    if len(candidate_lines) == 1:
+        return candidate_lines
+
+    # If there are 0 or multiple candidates, ask the AI to pick the
+    # single most relevant line, but constrain it to ONLY choose from
+    # numbers we already extracted - it cannot invent a new one.
     prompt = f"""Analyze this Python code and its error traceback.
-Identify the line number(s) in the CODE where the error occurred.
-Use only line numbers that actually appear in the traceback or that you can
-verify by counting lines in the CODE. Do not guess or invent line numbers.
+
+The traceback mentions these candidate line numbers (extracted directly
+from the traceback text): {candidate_lines}
+
+Identify which of these candidate line numbers best represents where the
+actual error occurred (usually the deepest/last frame in the traceback).
+Only return number(s) from this candidate list - do not invent new ones.
 
 CODE:
 {code}
@@ -102,8 +126,14 @@ TRACEBACK:
     )
 
     result = ErrorAnalysis.model_validate_json(response.choices[0].message.content)
-    return result.error_lines
 
+    # Safety net: if the AI still returns something outside our known
+    # candidates, fall back to the last (deepest) candidate line instead
+    # of trusting a hallucinated number.
+    if candidate_lines and not all(l in candidate_lines for l in result.error_lines):
+        return [candidate_lines[-1]]
+
+    return result.error_lines if result.error_lines else candidate_lines
 # ---------- Endpoint ----------
 
 @app.post("/code-interpreter")
