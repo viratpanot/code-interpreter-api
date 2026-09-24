@@ -35,6 +35,30 @@ class ErrorAnalysis(BaseModel):
 
 import concurrent.futures
 
+def clean_traceback(tb: str) -> str:
+    """
+    Remove internal ThreadPoolExecutor/threading frames from the traceback,
+    keeping only what a plain exec() call would have produced.
+    """
+    lines = tb.splitlines(keepends=True)
+    cleaned = []
+    skip_block = False
+
+    for line in lines:
+        # Start of an internal frame block we want to hide
+        if 'File "' in line and ('concurrent/futures' in line or 'threading.py' in line):
+            skip_block = True
+            continue
+        # Once we hit the user's own <string> frame, stop skipping
+        if 'File "<string>"' in line:
+            skip_block = False
+        if skip_block:
+            continue
+        cleaned.append(line)
+
+    return "".join(cleaned)
+
+
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
     sys.stdout = StringIO()
@@ -45,13 +69,14 @@ def execute_python_code(code: str) -> dict:
     try:
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(run)
-            future.result(timeout=5)  # 5 second limit
+            future.result(timeout=5)
         output = sys.stdout.getvalue()
         return {"success": True, "output": output}
     except concurrent.futures.TimeoutError:
         return {"success": False, "output": "Error: code execution timed out"}
     except Exception:
         output = traceback.format_exc()
+        output = clean_traceback(output)
         return {"success": False, "output": output}
     finally:
         sys.stdout = old_stdout
